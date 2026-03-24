@@ -103,3 +103,135 @@
 - `.claude/agents/quality-validator.md`
 - `.claude/agents/report-generator.md`
 - `.claude/agents/qa-agent.md`
+
+## 폴더 구조
+
+```
+PDFTEXT_READ/
+│
+├── CLAUDE.md                          # 프로젝트 규칙 및 전체 폴더 구조 (이 파일)
+├── main.py                            # CLI 진입점 (python main.py <pdf> [options])
+├── requirements.txt                   # Python 패키지 의존성
+│
+├── src/                               # 핵심 구현 소스
+│   ├── __init__.py
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   └── state.py                   # 상태 enum, TextBlock, PageInfo, PipelineContext 정의
+│   │
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   ├── logger.py                  # 로깅 설정 (콘솔 + 파일)
+│   │   └── image_utils.py             # PDF 페이지 렌더링, 스캔 전처리, XLSX용 리사이즈
+│   │
+│   └── pipeline/                      # 파이프라인 단계별 스크립트
+│       ├── __init__.py
+│       ├── step0_init.py              # Step 0 : 입력 검증 / 작업 디렉터리 초기화
+│       ├── step0_5_classify.py        # Step 0.5: 문서 유형 판정 (DIGITAL/SCANNED/HYBRID)
+│       ├── step1_text_layer.py        # Step 1 : 텍스트 레이어 추출 (pdfplumber)
+│       ├── step1_5_preprocess.py      # Step 1.5: 스캔 페이지 이미지 전처리 (OpenCV)
+│       ├── step2_vision.py            # Step 2 : OCR 실행 (tesseract / easyocr)
+│       ├── step3_reconcile.py         # Step 3 : 텍스트 레이어 + OCR 정합 및 읽기 순서 복원
+│       ├── step4_skip.py              # Step 4 : 저신뢰도 텍스트 SKIPPED/UNKNOWN 처리
+│       ├── step5_validate.py          # Step 5 : 품질 판정 (VALIDATED / APPROVED_WITH_WARNINGS)
+│       ├── step6_csv.py               # Step 6 : final_output.csv 생성
+│       └── step7_xlsx.py              # Step 7 : review_output.xlsx 생성 (이미지 + 텍스트)
+│
+├── docs/                              # 프로젝트 규칙 문서
+│   ├── project-scope-and-rules.md
+│   ├── io-contracts.md
+│   ├── workflow-and-failures.md
+│   └── testing-and-qa.md
+│
+├── .claude/                           # Claude 에이전트 정의
+│   └── agents/
+│       ├── main-orchestrator.md
+│       ├── layout-reconstructor.md
+│       ├── quality-validator.md
+│       ├── report-generator.md
+│       └── qa-agent.md
+│
+├── qa/                                # QA 회귀 테스트 자산
+│   ├── __init__.py
+│   ├── run_qa.py                      # QA 실행 스크립트 (python qa/run_qa.py)
+│   ├── samples/                       # 샘플 PDF 파일들 (.pdf)
+│   ├── answers/                       # 정답 JSON 파일들 (<stem>.json)
+│   ├── fixtures/                      # 고정 테스트 픽스처
+│   └── reports/                       # QA 결과 리포트 (자동 생성)
+│
+└── output/                            # 실행 결과 출력 디렉터리 (자동 생성)
+    └── <pdf_stem>_<timestamp>/        # 실행별 작업 디렉터리
+        ├── final_output.csv           # 최종 텍스트 추출 결과 (CSV)
+        ├── review_output.xlsx         # 검수용 XLSX (이미지 + 텍스트)
+        ├── pipeline.log               # 실행 로그
+        ├── intermediate/              # 단계별 중간 산출물 JSON
+        │   ├── step0_manifest.json
+        │   ├── document_classification.json
+        │   ├── step1_text_layer.json
+        │   ├── step1_5_preprocessed_images.json
+        │   ├── step2_vision_layout.json
+        │   ├── step3_reconciled.json
+        │   ├── step4_skip_resolution.json
+        │   ├── summary.json
+        │   └── review_required_pages.json
+        ├── images/                    # 렌더링된 PDF 페이지 이미지 (page_001.png …)
+        └── preprocessed/              # 전처리된 페이지 이미지 (page_001_pre.png …)
+```
+
+## 실행 방법
+
+### 설치
+```bash
+pip install -r requirements.txt
+# Tesseract OCR 별도 설치 필요:
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+# macOS:   brew install tesseract tesseract-lang
+# Linux:   sudo apt install tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng
+```
+
+### 기본 실행
+```bash
+python main.py document.pdf
+```
+
+### 옵션 예시
+```bash
+# 페이지 범위 지정
+python main.py document.pdf --pages 1-5
+
+# OCR 강제 적용 (스캔본으로 처리)
+python main.py document.pdf --ocr-priority
+
+# 읽기 방향 강제 지정
+python main.py document.pdf --force-direction TOP_TO_BOTTOM
+
+# 신뢰도 임계값 조정 (기본 0.5)
+python main.py document.pdf --confidence-threshold 0.6
+
+# 전처리 비활성화
+python main.py document.pdf --no-preprocess
+
+# EasyOCR 사용 (설치 필요: pip install easyocr)
+python main.py document.pdf --ocr-engine easyocr
+```
+
+### QA 실행
+```bash
+# 전체 샘플 QA
+python qa/run_qa.py
+
+# 특정 샘플만
+python qa/run_qa.py --sample my_doc.pdf --verbose
+```
+
+## QA 정답 파일 형식 (qa/answers/<stem>.json)
+```json
+{
+  "doc_type": "DIGITAL",
+  "blocks": [
+    {"page_num": 1, "order_index": 0, "text": "예상 텍스트"},
+    {"page_num": 1, "order_index": 1, "text": "두 번째 텍스트"}
+  ]
+}
+```
