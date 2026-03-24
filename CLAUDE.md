@@ -62,9 +62,26 @@
 - 실행 단계 스킵은 허용하지만, QA 단계에서는 스킵을 성공으로 인정하지 않는다.
 
 ## 판단과 코드의 역할 분리
-- 문서 유형 판정 해석, 방향 판정, 정합 해석, 스킵 정책 판단, QA 실패 원인 분류는 에이전트가 담당한다.
-- PDF 파싱, OCR 호출, 점수 계산, bbox 정규화, CSV/XLSX 생성, 회귀 테스트 실행은 스크립트가 담당한다.
-- 결정론적으로 반복 가능한 로직을 LLM 판단으로 대체하지 말 것.
+
+### LLM(Claude API) 담당 – `src/utils/llm_client.py` 경유
+| 단계 | 파일 | LLM 역할 |
+|------|------|----------|
+| Step 0.5 | `step0_5_classify.py` | 페이지 이미지를 보고 DIGITAL/SCANNED/HYBRID 및 읽기 방향 판정 |
+| Step 3   | `step3_reconcile.py`  | 텍스트 레이어 샘플과 OCR 샘플 비교 후 어느 소스를 신뢰할지 결정 |
+| Step 5   | `step5_validate.py`   | 추출 결과 통계와 샘플로 품질 평가, VALIDATED/APPROVED_WITH_WARNINGS 결정 |
+| QA       | `qa/run_qa.py`        | 불일치 원인을 CODE/DOCUMENT/RULE/ANSWER_DATA 이슈로 분류, 수정 피드백 생성 |
+
+LLM 호출 실패 시 모든 단계가 규칙 기반 fallback으로 자동 전환한다.
+
+### 스크립트 담당
+- PDF 파싱, OCR 호출, bbox 정규화, 읽기 순서 정렬, CSV/XLSX 생성, 회귀 테스트 실행
+
+### 환경 변수
+```
+ANTHROPIC_API_KEY=sk-ant-...   # LLM 호출에 필수
+```
+
+- 결정론적으로 반복 가능한 로직을 LLM 판단으로 대체하지 말 것 (위 4곳 이외).
 
 ## 수정 원칙
 - 기존 구조를 유지하면서 필요한 파일만 최소 범위로 수정한다.
@@ -123,7 +140,8 @@ PDFTEXT_READ/
 │   ├── utils/
 │   │   ├── __init__.py
 │   │   ├── logger.py                  # 로깅 설정 (콘솔 + 파일)
-│   │   └── image_utils.py             # PDF 페이지 렌더링, 스캔 전처리, XLSX용 리사이즈
+│   │   ├── image_utils.py             # PDF 페이지 렌더링, 스캔 전처리, XLSX용 리사이즈
+│   │   └── llm_client.py              # Claude API 래퍼 (ask_json / ask_with_image / ask_text)
 │   │
 │   └── pipeline/                      # 파이프라인 단계별 스크립트
 │       ├── __init__.py
@@ -151,6 +169,9 @@ PDFTEXT_READ/
 │       ├── quality-validator.md
 │       ├── report-generator.md
 │       └── qa-agent.md
+│
+├── input/                             # PDF 입력 폴더 (--batch 모드 기본 경로)
+│   └── *.pdf                          # 처리할 PDF 파일들을 여기에 넣기
 │
 ├── qa/                                # QA 회귀 테스트 자산
 │   ├── __init__.py
@@ -190,9 +211,23 @@ pip install -r requirements.txt
 # Linux:   sudo apt install tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng
 ```
 
-### 기본 실행
+### 환경 변수 설정
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # LLM 판정에 필수
+```
+
+### 기본 실행 (단일 파일)
 ```bash
 python main.py document.pdf
+```
+
+### 일괄 처리 (input/ 폴더)
+```bash
+# PDF를 input/ 폴더에 넣고 실행
+python main.py --batch
+
+# 다른 폴더 지정
+python main.py --input-dir /path/to/pdfs --output-dir /path/to/results
 ```
 
 ### 옵션 예시

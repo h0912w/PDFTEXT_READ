@@ -1,13 +1,16 @@
 """
 Step 3: Reconciliation of text layer and OCR results.
+에이전트(LLM) 담당 영역.
 
-Priority rules:
-  DIGITAL : text = Step 1 (text layer), position = Step 2 (OCR bbox)
-  SCANNED : text + position = Step 2 (OCR)
-  HYBRID  : per-page decision based on text_coverage
+Claude가 텍스트 레이어 샘플과 OCR 샘플을 비교하고
+어느 소스를 신뢰할지 페이지별로 판단한다.
 
-After reconciliation, all TextBlocks are assigned final order_index values
-according to the page reading direction.
+우선순위 규칙:
+  DIGITAL : 문자 = Step 1 (텍스트 레이어), 위치 = Step 2 (OCR bbox)
+  SCANNED : 문자 + 위치 = Step 2 (OCR)
+  HYBRID  : LLM이 페이지별로 판단
+
+LLM 실패 시 coverage 기반 fallback.
 
 State transition: VISION_ANALYZED → RECONCILED
 """
@@ -26,21 +29,50 @@ from src.models.state import (
     TextStatus,
 )
 from src.pipeline.step1_text_layer import _sort_ltr, _sort_ttb
+from src.utils.llm_client import ask_json
 from src.utils.logger import get_logger
 
-# Text-coverage threshold below which we prefer OCR even on HYBRID pages
-_HYBRID_OCR_THRESHOLD = 0.15
+_HYBRID_OCR_THRESHOLD = 0.15   # 이 값 미만이면 OCR 우선 (fallback용)
+_SAMPLE_SIZE = 5                # LLM에 전달할 샘플 블록 수
+
+_RECONCILE_PROMPT = """\
+당신은 PDF 텍스트 추출 전문가입니다.
+한 PDF 페이지에서 두 가지 소스로 텍스트를 추출했습니다.
+
+문서 유형: {doc_type}
+텍스트 레이어 커버리지: {coverage:.1%}
+
+[텍스트 레이어 샘플 (최대 {n}개)]
+{tl_sample}
+
+[OCR 결과 샘플 (최대 {n}개)]
+{ocr_sample}
+
+판단 기준:
+- DIGITAL 문서에서 텍스트 레이어가 있으면 텍스트 레이어의 문자가 더 정확합니다.
+- SCANNED 문서에서는 OCR 결과가 유일한 소스입니다.
+- HYBRID에서는 텍스트 품질(깨짐, 공백 오류, 인코딩 문제 여부)을 비교해서 판단하세요.
+
+아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
+{{
+  "use_ocr_text": true | false,
+  "reason": "판단 근거 한 문장"
+}}
+
+use_ocr_text=true  → OCR 결과를 주 텍스트 소스로 사용
+use_ocr_text=false → 텍스트 레이어를 주 텍스트 소스로 사용
+"""
 
 
 def run(ctx: PipelineContext) -> PipelineContext:
-    """Merge text-layer and OCR sources into final TextBlocks."""
+    """LLM을 사용해 텍스트 레이어와 OCR 결과를 정합한다."""
     logger = get_logger()
-    logger.info("Step 3: Reconciling text layer and OCR results…")
+    logger.info("Step 3: LLM으로 텍스트 소스 정합 중…")
 
     try:
         ocr_raw: Dict[str, List[Dict]] = ctx.options.pop("_ocr_raw", {})
 
-        # Rebuild text-layer lookup: page_num → [word_dict]
+        # 텍스트 레이어 블록을 페이지별로 정리
         tl_by_page: Dict[int, List[TextBlock]] = {}
         for tb in ctx.text_blocks:
             if tb.source == "text_layer":
@@ -53,26 +85,20 @@ def run(ctx: PipelineContext) -> PipelineContext:
             tl_blocks = tl_by_page.get(pi.page_num, [])
             ocr_words = ocr_raw.get(str(pi.page_num), [])
 
-            # Decide per-page strategy
-            use_ocr_text = _should_use_ocr_text(pi)
+            # LLM에게 소스 우선순위 판단 위임
+            use_ocr = _decide_source_with_llm(pi, tl_blocks, ocr_words, logger)
 
-            if use_ocr_text and ocr_words:
-                # SCANNED or low-coverage HYBRID: use OCR entirely
+            if use_ocr and ocr_words:
                 page_blocks = _blocks_from_ocr(ocr_words, pi.page_num, pi.direction)
             elif tl_blocks:
-                # DIGITAL or high-coverage HYBRID: use text layer text
-                # Enhance position with OCR bbox if available
                 page_blocks = _blocks_from_text_layer(tl_blocks, ocr_words, pi.direction)
             elif ocr_words:
-                # Fallback: text layer is empty, use OCR
                 page_blocks = _blocks_from_ocr(ocr_words, pi.page_num, pi.direction)
-                ctx.add_warning(f"Page {pi.page_num}: text layer empty, fell back to OCR.")
+                ctx.add_warning(f"Page {pi.page_num}: 텍스트 레이어 없음 → OCR로 fallback.")
             else:
-                # Both empty
-                ctx.add_warning(f"Page {pi.page_num}: no text from either source.")
+                ctx.add_warning(f"Page {pi.page_num}: 두 소스 모두 비어 있음.")
                 page_blocks = []
 
-            # Apply reading-order sort and assign order_index
             sorted_blocks = _sort_blocks(page_blocks, pi.direction)
             for tb in sorted_blocks:
                 tb.order_index = order_idx
@@ -80,45 +106,85 @@ def run(ctx: PipelineContext) -> PipelineContext:
             reconciled.extend(sorted_blocks)
 
             logger.info(
-                f"  Page {pi.page_num}: {len(sorted_blocks)} block(s) "
-                f"({'OCR' if use_ocr_text else 'text_layer'} priority)."
+                f"  Page {pi.page_num}: {len(sorted_blocks)}개 블록 "
+                f"({'OCR' if use_ocr else '텍스트 레이어'} 우선)"
             )
 
         ctx.text_blocks = reconciled
         ctx.status = ProcessingStatus.RECONCILED
         _save(ctx)
-        logger.info(f"Step 3 complete. Total blocks: {len(reconciled)}, Status: {ctx.status}")
+        logger.info(f"Step 3 완료. 총 블록: {len(reconciled)}, Status: {ctx.status}")
 
     except Exception as exc:
         ctx.status = ProcessingStatus.FAILED
-        ctx.add_error(f"Step 3 failed: {exc}")
-        logger.error(f"Step 3 failed: {exc}", exc_info=True)
+        ctx.add_error(f"Step 3 실패: {exc}")
+        logger.error(f"Step 3 실패: {exc}", exc_info=True)
 
     return ctx
 
 
-# ── Strategy helpers ──────────────────────────────────────────────────────
+# ── LLM 소스 판단 ─────────────────────────────────────────────────────────
 
-def _should_use_ocr_text(pi) -> bool:
-    """Decide whether to use OCR as primary text source for this page."""
+def _decide_source_with_llm(pi, tl_blocks, ocr_words, logger) -> bool:
+    """
+    LLM에게 이 페이지의 텍스트 소스를 OCR로 할지 텍스트 레이어로 할지 물어본다.
+    SCANNED는 무조건 OCR, DIGITAL은 텍스트 레이어 우선 – LLM은 HYBRID와 애매한 경우 판단.
+    """
+    # 명확한 케이스: LLM 불필요
     if pi.doc_type == DocumentType.SCANNED.value:
         return True
-    if pi.doc_type == DocumentType.HYBRID.value and pi.text_coverage < _HYBRID_OCR_THRESHOLD:
-        return True
-    return False
+    if pi.doc_type == DocumentType.DIGITAL.value and tl_blocks:
+        return False
 
+    # HYBRID 또는 판단 애매한 경우 → LLM 판단
+    tl_sample = _format_sample(
+        [{"text": b.text} for b in tl_blocks[:_SAMPLE_SIZE]]
+    )
+    ocr_sample = _format_sample(ocr_words[:_SAMPLE_SIZE])
+
+    if not tl_sample and not ocr_sample:
+        return False
+
+    prompt = _RECONCILE_PROMPT.format(
+        doc_type=pi.doc_type,
+        coverage=pi.text_coverage,
+        n=_SAMPLE_SIZE,
+        tl_sample=tl_sample or "(없음)",
+        ocr_sample=ocr_sample or "(없음)",
+    )
+
+    fallback_use_ocr = pi.text_coverage < _HYBRID_OCR_THRESHOLD
+    fallback = {"use_ocr_text": fallback_use_ocr, "reason": "LLM 실패 – coverage 기반 fallback"}
+
+    try:
+        result = ask_json(prompt, fallback=None)
+        use_ocr = bool(result.get("use_ocr_text", fallback_use_ocr))
+        logger.debug(f"  Page {pi.page_num} LLM 정합 근거: {result.get('reason', '')}")
+        return use_ocr
+    except Exception as exc:
+        logger.warning(f"  Page {pi.page_num}: LLM 정합 실패 ({exc}), fallback 적용.")
+        return fallback_use_ocr
+
+
+def _format_sample(words: List[Dict]) -> str:
+    """샘플 단어 목록을 LLM 전달용 텍스트로 변환."""
+    if not words:
+        return ""
+    return "\n".join(f"  - {w.get('text', '')}" for w in words[:_SAMPLE_SIZE])
+
+
+# ── 블록 생성 헬퍼 ────────────────────────────────────────────────────────
 
 def _blocks_from_ocr(
     ocr_words: List[Dict[str, Any]], page_num: int, direction: str
 ) -> List[TextBlock]:
-    """Convert raw OCR word dicts to TextBlocks."""
     blocks = []
     for w in ocr_words:
         text = str(w.get("text", "")).strip()
         if not text:
             continue
         blocks.append(TextBlock(
-            order_index=0,  # Will be assigned later
+            order_index=0,
             page_num=page_num,
             text=text,
             bbox=w.get("bbox", [0, 0, 1, 1]),
@@ -137,16 +203,11 @@ def _blocks_from_text_layer(
     ocr_words: List[Dict[str, Any]],
     direction: str,
 ) -> List[TextBlock]:
-    """
-    Use text-layer text. If OCR bboxes are available, snap each text-layer
-    block to the spatially closest OCR bbox for more accurate positioning.
-    """
+    """텍스트 레이어 문자 + OCR bbox 위치 보정."""
     if not ocr_words:
         return list(tl_blocks)
 
-    # Build OCR bbox lookup (list of [x0,y0,x1,y1])
     ocr_bboxes = [w["bbox"] for w in ocr_words if w.get("bbox")]
-
     result = []
     for tb in tl_blocks:
         best_bbox = _closest_bbox(tb.bbox, ocr_bboxes)
@@ -165,41 +226,26 @@ def _blocks_from_text_layer(
     return result
 
 
-def _closest_bbox(
-    ref_bbox: List[float], candidates: List[List[float]], max_dist: float = 0.05
-) -> List[float]:
-    """Return the candidate bbox whose center is closest to ref_bbox center."""
-    ref_cx = (ref_bbox[0] + ref_bbox[2]) / 2
-    ref_cy = (ref_bbox[1] + ref_bbox[3]) / 2
-
-    best = None
-    best_dist = float("inf")
+def _closest_bbox(ref: List[float], candidates: List[List[float]], max_dist: float = 0.05):
+    ref_cx = (ref[0] + ref[2]) / 2
+    ref_cy = (ref[1] + ref[3]) / 2
+    best, best_dist = None, float("inf")
     for bb in candidates:
-        cx = (bb[0] + bb[2]) / 2
-        cy = (bb[1] + bb[3]) / 2
-        dist = ((cx - ref_cx) ** 2 + (cy - ref_cy) ** 2) ** 0.5
-        if dist < best_dist:
-            best_dist = dist
-            best = bb
-
-    if best and best_dist <= max_dist:
-        return best
-    return ref_bbox
+        d = ((((bb[0] + bb[2]) / 2) - ref_cx) ** 2 + (((bb[1] + bb[3]) / 2) - ref_cy) ** 2) ** 0.5
+        if d < best_dist:
+            best_dist, best = d, bb
+    return best if best and best_dist <= max_dist else None
 
 
 def _sort_blocks(blocks: List[TextBlock], direction: str) -> List[TextBlock]:
-    """Sort TextBlocks into reading order."""
     if not blocks:
         return blocks
-
-    # Convert to word-dicts for reuse of step1 sort helpers
     word_dicts = [{"text": b.text, "bbox": b.bbox, "_block": b} for b in blocks]
-
-    if direction == ReadingDirection.LEFT_TO_RIGHT.value:
-        sorted_dicts = _sort_ltr(word_dicts)
-    else:
-        sorted_dicts = _sort_ttb(word_dicts)
-
+    sorted_dicts = (
+        _sort_ltr(word_dicts)
+        if direction == ReadingDirection.LEFT_TO_RIGHT.value
+        else _sort_ttb(word_dicts)
+    )
     return [d["_block"] for d in sorted_dicts]
 
 
@@ -207,6 +253,7 @@ def _save(ctx: PipelineContext) -> None:
     path = os.path.join(ctx.work_dir, "intermediate", "step3_reconciled.json")
     data = {
         "status": ctx.status,
+        "reconciler": "llm",
         "total_blocks": len(ctx.text_blocks),
         "blocks": [tb.to_dict() for tb in ctx.text_blocks],
     }
