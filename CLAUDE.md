@@ -63,25 +63,31 @@
 
 ## 판단과 코드의 역할 분리
 
-### LLM(Claude API) 담당 – `src/utils/llm_client.py` 경유
-| 단계 | 파일 | LLM 역할 |
-|------|------|----------|
-| Step 0.5 | `step0_5_classify.py` | 페이지 이미지를 보고 DIGITAL/SCANNED/HYBRID 및 읽기 방향 판정 |
-| Step 3   | `step3_reconcile.py`  | 텍스트 레이어 샘플과 OCR 샘플 비교 후 어느 소스를 신뢰할지 결정 |
-| Step 5   | `step5_validate.py`   | 추출 결과 통계와 샘플로 품질 평가, VALIDATED/APPROVED_WITH_WARNINGS 결정 |
-| QA       | `qa/run_qa.py`        | 불일치 원인을 CODE/DOCUMENT/RULE/ANSWER_DATA 이슈로 분류, 수정 피드백 생성 |
+### Claude Code(이 대화) 담당
+Claude Code 자체가 LLM이므로, API를 별도 호출하지 않는다.
+파이프라인을 단계별로 실행하면서 판단이 필요한 시점에 직접 개입한다.
 
-LLM 호출 실패 시 모든 단계가 규칙 기반 fallback으로 자동 전환한다.
+| 단계 | 파일 | Claude Code 역할 | 입력 파일 | 출력 파일 |
+|------|------|-----------------|-----------|-----------|
+| Step 0.5 | `step0_5_classify.py` | 페이지 이미지를 직접 보고 DIGITAL/SCANNED/HYBRID + 읽기방향 판정 | `classify_input.json` | `classify_decision.json` |
+| Step 2   | `step2_vision.py`     | 페이지 이미지에서 텍스트와 위치(bbox) 직접 추출 (OCR) | `vision_input.json` | `vision_output.json` |
+| Step 3   | `step3_reconcile.py`  | 텍스트 레이어 샘플 vs OCR 샘플 비교 후 소스 결정 | `reconcile_input.json` | `reconcile_decision.json` |
+| Step 5   | `step5_validate.py`   | 추출 통계+샘플 보고 품질 평가 후 VALIDATED/APPROVED_WITH_WARNINGS 결정 | `validate_input.json` | `validate_decision.json` |
+| QA       | `qa/run_qa.py`        | 불일치 원인 분류 및 수정 피드백 생성 | `qa_failure_input.json` | `qa_failure_analysis.json` |
 
-### 스크립트 담당
-- PDF 파싱, OCR 호출, bbox 정규화, 읽기 순서 정렬, CSV/XLSX 생성, 회귀 테스트 실행
+모든 판단 단계는 decision 파일이 없으면 규칙 기반 fallback으로 자동 진행된다.
 
-### 환경 변수
-```
-ANTHROPIC_API_KEY=sk-ant-...   # LLM 호출에 필수
-```
+### 스크립트 담당 (결정론적, 반복 가능)
+- PDF 파싱 및 텍스트 레이어 추출 (pdfplumber)
+- PDF → 이미지 렌더링 (PyMuPDF)
+- 스캔 이미지 전처리 (OpenCV)
+- 읽기 순서 정렬 (bbox 기반)
+- CSV / XLSX 생성
+- QA 비교 및 리포트 저장
 
-- 결정론적으로 반복 가능한 로직을 LLM 판단으로 대체하지 말 것 (위 4곳 이외).
+### 추가 API 키 불필요
+- `anthropic` SDK 미사용 – 이 대화(Claude Code) 자체가 LLM
+- `pytesseract`, `easyocr` 미사용 – OCR은 Claude Code가 이미지 직독
 
 ## 수정 원칙
 - 기존 구조를 유지하면서 필요한 파일만 최소 범위로 수정한다.

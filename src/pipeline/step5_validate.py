@@ -1,11 +1,15 @@
 """
 Step 5: Quality validation and final routing.
-에이전트(LLM) 담당 영역.
+[에이전트(Claude Code) 판단 영역]
 
-Claude가 추출 결과 전체를 보고 품질을 평가하고
-최종 상태(VALIDATED / APPROVED_WITH_WARNINGS)를 결정한다.
+스크립트 역할:
+  1. 추출 통계 + 블록 샘플을 validate_input.json 에 저장
+  2. Claude가 작성한 validate_decision.json 을 읽어 최종 상태 결정
 
-LLM 실패 시 비율 기반 fallback.
+Claude Code 담당:
+  - validate_input.json 의 통계와 샘플을 보고
+  - VALIDATED / APPROVED_WITH_WARNINGS / NEEDS_REVIEW 결정
+  - validate_decision.json 에 결과 작성
 
 State transition: SKIP_RESOLVED → VALIDATED | APPROVED_WITH_WARNINGS
 """
@@ -16,47 +20,17 @@ import os
 from typing import List, Set
 
 from src.models.state import PipelineContext, ProcessingStatus, TextStatus
-from src.utils.llm_client import ask_json
 from src.utils.logger import get_logger
 
-_SAMPLE_FOR_LLM = 10    # LLM에 전달할 블록 샘플 수
-# Fallback 임계값
+_SAMPLE_SIZE = 10
 _SKIP_WARN_RATIO = 0.20
 _MIN_AVG_CONFIDENCE = 0.70
 
-_VALIDATE_PROMPT = """\
-당신은 PDF 텍스트 추출 품질 검사관입니다.
-아래 통계와 샘플을 보고 추출 결과의 품질을 평가하세요.
-
-=== 추출 통계 ===
-문서 유형: {doc_type}
-총 블록 수: {total}
-SKIPPED 블록: {skipped} ({skip_ratio:.1%})
-UNKNOWN 블록: {unknown}
-평균 신뢰도: {avg_conf:.2f}
-검토 필요 페이지: {review_pages}
-
-=== 텍스트 샘플 (최대 {n}개) ===
-{samples}
-
-=== 판단 기준 ===
-- VALIDATED         : 품질이 충분히 높아 자동 확정 가능
-- APPROVED_WITH_WARNINGS : 사용 가능하지만 일부 검토 필요
-- NEEDS_REVIEW      : 품질이 낮아 사람이 전체 검토해야 함
-
-아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
-{{
-  "decision": "VALIDATED" | "APPROVED_WITH_WARNINGS" | "NEEDS_REVIEW",
-  "reason": "판단 근거",
-  "concerns": ["구체적 우려사항 1", "우려사항 2"]
-}}
-"""
-
 
 def run(ctx: PipelineContext) -> PipelineContext:
-    """LLM으로 추출 품질을 평가하고 최종 상태를 결정한다."""
+    """추출 통계를 저장하고, Claude의 품질 판정을 읽어 최종 상태를 결정한다."""
     logger = get_logger()
-    logger.info("Step 5: LLM으로 품질 검증 중…")
+    logger.info("Step 5: 품질 검증 데이터 수집 중…")
 
     try:
         total = len(ctx.text_blocks)
@@ -74,21 +48,61 @@ def run(ctx: PipelineContext) -> PipelineContext:
         avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
         skip_ratio = (skipped + unknown) / max(1, total)
 
-        logger.info(
-            f"  총 {total}블록, SKIPPED={skipped}, UNKNOWN={unknown}, "
-            f"avg_conf={avg_conf:.2f}, 검토 페이지={sorted(review_pages)}"
-        )
+        # 샘플 블록 (OK + SKIPPED + UNKNOWN 혼합)
+        samples = [
+            {
+                "order_index": tb.order_index,
+                "page_num": tb.page_num,
+                "text": tb.text[:80],
+                "confidence": round(tb.confidence, 3),
+                "status": tb.status,
+                "source": tb.source,
+            }
+            for tb in ctx.text_blocks[:_SAMPLE_SIZE]
+        ]
 
-        # LLM 품질 평가
-        decision = _evaluate_with_llm(ctx, total, skipped, unknown, skip_ratio, avg_conf, review_pages, logger)
+        # validate_input.json 저장 (Claude 판단 재료)
+        input_path = os.path.join(ctx.work_dir, "intermediate", "validate_input.json")
+        with open(input_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "doc_type": ctx.doc_type,
+                "total_blocks": total,
+                "skipped": skipped,
+                "unknown": unknown,
+                "skip_ratio": round(skip_ratio, 4),
+                "avg_confidence": round(avg_conf, 4),
+                "review_pages": sorted(review_pages),
+                "warnings_so_far": ctx.warnings,
+                "samples": samples,
+            }, f, ensure_ascii=False, indent=2)
 
-        # NEEDS_REVIEW는 APPROVED_WITH_WARNINGS로 처리 (파이프라인은 계속 진행)
-        if decision == "VALIDATED":
+        logger.info(f"품질 판단 재료 저장: {input_path}")
+        logger.info(f"  통계: total={total}, skip={skipped}, unknown={unknown}, "
+                    f"avg_conf={avg_conf:.2f}, skip_ratio={skip_ratio:.1%}")
+        logger.info(">>> Claude Code가 validate_input.json 을 보고 validate_decision.json 을 작성해야 합니다.")
+
+        # validate_decision.json 읽기 (Claude 작성)
+        decision_path = os.path.join(ctx.work_dir, "intermediate", "validate_decision.json")
+        decision = _load_decision(decision_path, skip_ratio, avg_conf, total)
+
+        raw_decision = decision.get("decision", "VALIDATED")
+        reason = decision.get("reason", "")
+        concerns = decision.get("concerns", [])
+
+        for c in concerns:
+            ctx.add_warning(f"품질 우려: {c}")
+
+        # NEEDS_REVIEW → 파이프라인은 계속 진행하되 APPROVED_WITH_WARNINGS 처리
+        if raw_decision == "VALIDATED":
             ctx.status = ProcessingStatus.VALIDATED
         else:
             ctx.status = ProcessingStatus.APPROVED_WITH_WARNINGS
-            if decision == "NEEDS_REVIEW":
-                ctx.add_warning("LLM 평가: 전체 검토 필요 (NEEDS_REVIEW)")
+            if raw_decision == "NEEDS_REVIEW":
+                ctx.add_warning("전체 검토 필요 (NEEDS_REVIEW)")
+
+        logger.info(f"  품질 판정: {raw_decision} → {ctx.status}")
+        if reason:
+            logger.info(f"  근거: {reason}")
 
         _save(ctx, review_pages, avg_conf, skip_ratio)
         logger.info(f"Step 5 완료. Status: {ctx.status}")
@@ -101,84 +115,51 @@ def run(ctx: PipelineContext) -> PipelineContext:
     return ctx
 
 
-# ── LLM 품질 평가 ─────────────────────────────────────────────────────────
+def _load_decision(decision_path: str, skip_ratio: float, avg_conf: float, total: int) -> dict:
+    logger = get_logger()
+    if os.path.exists(decision_path):
+        with open(decision_path, encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info("validate_decision.json 로드 완료.")
+        return data
 
-def _evaluate_with_llm(
-    ctx, total, skipped, unknown, skip_ratio, avg_conf, review_pages, logger
-) -> str:
-    """Claude에게 품질 판정을 요청한다. 실패 시 규칙 기반 fallback."""
-
-    # 샘플 블록 생성 (OK, SKIPPED, UNKNOWN 혼합)
-    samples = []
-    for tb in ctx.text_blocks[:_SAMPLE_FOR_LLM]:
-        samples.append(f"  [{tb.status}] p{tb.page_num}: {tb.text[:60]!r}  (conf={tb.confidence:.2f})")
-    samples_text = "\n".join(samples) if samples else "(없음)"
-
-    prompt = _VALIDATE_PROMPT.format(
-        doc_type=ctx.doc_type or "UNKNOWN",
-        total=total,
-        skipped=skipped,
-        unknown=unknown,
-        skip_ratio=skip_ratio,
-        avg_conf=avg_conf,
-        review_pages=sorted(review_pages) or "없음",
-        n=_SAMPLE_FOR_LLM,
-        samples=samples_text,
-    )
-
-    # Fallback 결정 (규칙 기반)
+    logger.warning("validate_decision.json 없음 → 규칙 기반 fallback 적용.")
     if skip_ratio > _SKIP_WARN_RATIO or avg_conf < _MIN_AVG_CONFIDENCE or total == 0:
         fallback_decision = "APPROVED_WITH_WARNINGS"
+        concerns = []
+        if skip_ratio > _SKIP_WARN_RATIO:
+            concerns.append(f"높은 스킵 비율: {skip_ratio:.1%}")
+        if avg_conf < _MIN_AVG_CONFIDENCE:
+            concerns.append(f"낮은 평균 신뢰도: {avg_conf:.2f}")
     else:
         fallback_decision = "VALIDATED"
+        concerns = []
 
-    fallback = {
+    result = {
         "decision": fallback_decision,
-        "reason": "LLM 실패 – 규칙 기반 fallback",
-        "concerns": [],
+        "reason": "fallback: validate_decision.json 없음",
+        "concerns": concerns,
     }
-
-    try:
-        result = ask_json(prompt, fallback=None)
-        decision = result.get("decision", fallback_decision)
-        reason = result.get("reason", "")
-        concerns = result.get("concerns", [])
-
-        logger.info(f"  LLM 품질 판정: {decision}")
-        if reason:
-            logger.info(f"  근거: {reason}")
-        for c in concerns:
-            ctx.add_warning(f"품질 우려: {c}")
-            logger.warning(f"  우려: {c}")
-
-        # 허용 값 검증
-        if decision not in ("VALIDATED", "APPROVED_WITH_WARNINGS", "NEEDS_REVIEW"):
-            decision = fallback_decision
-
-        return decision
-
-    except Exception as exc:
-        logger.warning(f"  LLM 품질 평가 실패 ({exc}), fallback 적용: {fallback_decision}")
-        return fallback_decision
+    with open(decision_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    return result
 
 
-def _save(ctx: PipelineContext, review_pages, avg_conf, skip_ratio) -> None:
+def _save(ctx, review_pages, avg_conf, skip_ratio):
     summary_path = os.path.join(ctx.work_dir, "intermediate", "summary.json")
-    summary = {
-        "status": ctx.status,
-        "validator": "llm",
-        "pdf_path": ctx.pdf_path,
-        "doc_type": ctx.doc_type,
-        "total_pages": len(ctx.page_infos),
-        "total_blocks": len(ctx.text_blocks),
-        "skipped_count": ctx.skipped_count,
-        "skip_ratio": skip_ratio,
-        "avg_confidence": avg_conf,
-        "warnings": ctx.warnings,
-        "errors": ctx.errors,
-    }
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "status": ctx.status,
+            "pdf_path": ctx.pdf_path,
+            "doc_type": ctx.doc_type,
+            "total_pages": len(ctx.page_infos),
+            "total_blocks": len(ctx.text_blocks),
+            "skipped_count": ctx.skipped_count,
+            "skip_ratio": skip_ratio,
+            "avg_confidence": avg_conf,
+            "warnings": ctx.warnings,
+            "errors": ctx.errors,
+        }, f, ensure_ascii=False, indent=2)
 
     review_path = os.path.join(ctx.work_dir, "intermediate", "review_required_pages.json")
     with open(review_path, "w", encoding="utf-8") as f:

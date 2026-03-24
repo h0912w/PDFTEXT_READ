@@ -1,14 +1,15 @@
 """
 QA Regression Test Runner
-에이전트(LLM) 담당 영역: 실패 원인 분류 및 수정 피드백.
+[에이전트(Claude Code) 판단 영역: 실패 원인 분류]
 
 절차:
   1. qa/samples/ 의 PDF마다 파이프라인 실행
   2. 결과 CSV를 qa/answers/ 정답과 비교
-  3. 불일치 발견 시 Claude에게 실패 원인 분류 요청
-  4. qa/reports/ 에 리포트 저장
+  3. 불일치 발견 시 qa_failure_input.json 저장
+     → Claude Code가 읽고 qa_failure_analysis.json 작성
+  4. qa/reports/ 에 최종 리포트 저장
 
-통과 기준 (testing-and-qa.md):
+통과 기준:
   - 모든 샘플 PASS
   - skipped_count = 0
   - 정답 100% 일치
@@ -40,7 +41,6 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from main import run_pipeline
-from src.utils.llm_client import ask_json
 from src.utils.logger import setup_logger
 
 _SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "samples")
@@ -50,32 +50,6 @@ _QA_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "_qa_output")
 
 _PASS = "PASS"
 _FAIL = "FAIL"
-
-_FAILURE_CLASSIFY_PROMPT = """\
-당신은 PDF 텍스트 추출 파이프라인의 QA 실패 분석 전문가입니다.
-아래 정보를 바탕으로 실패 원인을 분류하고 수정 방향을 제시하세요.
-
-=== 샘플 정보 ===
-샘플명: {sample}
-문서 유형: {doc_type}
-불일치 수: {mismatch_count}
-
-=== 불일치 목록 (최대 10개) ===
-{mismatches}
-
-=== 분류 기준 ===
-- CODE_ISSUE       : 추출/정합/정렬 알고리즘의 버그
-- DOCUMENT_ISSUE   : 이 특정 문서 특성(폰트, 인코딩, 레이아웃)으로 인한 문제
-- RULE_ISSUE       : 분류/방향 판정/스킵 규칙이 이 케이스에 맞지 않음
-- ANSWER_DATA_ISSUE: 정답 데이터 자체가 잘못되었을 가능성
-
-아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
-{{
-  "cause": "CODE_ISSUE" | "DOCUMENT_ISSUE" | "RULE_ISSUE" | "ANSWER_DATA_ISSUE",
-  "explanation": "원인 상세 설명",
-  "fix_suggestion": "구체적인 수정 방향"
-}}
-"""
 
 
 def main() -> int:
@@ -98,10 +72,11 @@ def main() -> int:
     samples = [os.path.join(_SAMPLES_DIR, args.sample)] if args.sample else _collect_samples()
 
     if not samples:
-        print("[QA] qa/samples/ 에 PDF가 없습니다. PDF와 정답 JSON을 추가하세요.")
+        print("[QA] qa/samples/ 에 PDF가 없습니다.")
         return 1
 
     results: List[Dict[str, Any]] = []
+    failure_inputs: List[Dict] = []  # Claude가 분류해야 할 실패 목록
 
     for sample_path in samples:
         stem = os.path.splitext(os.path.basename(sample_path))[0]
@@ -109,22 +84,16 @@ def main() -> int:
 
         logger.info(f"\n--- 샘플: {stem} ---")
 
-        # 정답 파일 확인
         if not os.path.exists(answer_path):
-            result = _make_result(stem, _FAIL, "MISSING_ANSWER",
-                                  f"정답 파일 없음: {answer_path}")
+            result = _make_result(stem, _FAIL, "MISSING_ANSWER", f"정답 파일 없음: {answer_path}")
             results.append(result)
             logger.error(f"  FAIL: {result['reason']}")
             continue
 
-        # 파이프라인 실행 (QA 모드: confidence_threshold=0 → 스킵 없이 전부 추출)
         sample_out_dir = os.path.join(_QA_OUTPUT_DIR, stem)
         try:
-            rc = run_pipeline(
-                sample_path,
-                output_dir=sample_out_dir,
-                options={"confidence_threshold": 0.0},
-            )
+            rc = run_pipeline(sample_path, output_dir=sample_out_dir,
+                              options={"confidence_threshold": 0.0})
         except Exception as exc:
             result = _make_result(stem, _FAIL, "PIPELINE_EXCEPTION", str(exc))
             results.append(result)
@@ -134,63 +103,64 @@ def main() -> int:
         if rc != 0:
             result = _make_result(stem, _FAIL, "PIPELINE_FAILED", "파이프라인 비정상 종료")
             results.append(result)
-            logger.error("  FAIL: 파이프라인 비정상 종료")
             continue
 
-        # CSV 탐색
         csv_path = _find_output_csv(sample_out_dir)
         if not csv_path:
             result = _make_result(stem, _FAIL, "CSV_NOT_FOUND", "final_output.csv 생성 안 됨")
             results.append(result)
-            logger.error("  FAIL: CSV 없음")
             continue
 
         actual_blocks = _load_csv(csv_path)
         expected = _load_answer(answer_path)
-
         if expected is None:
             result = _make_result(stem, _FAIL, "ANSWER_PARSE_ERROR", "정답 JSON 파싱 실패")
             results.append(result)
             continue
 
-        # 스킵 수 검사 (QA 통과 조건: 0이어야 함)
         skipped = sum(1 for b in actual_blocks if b.get("status") in ("SKIPPED", "UNKNOWN"))
         if skipped > 0:
-            result = _make_result(
-                stem, _FAIL, "SKIPPED_ITEMS",
-                f"스킵 {skipped}개 존재 (QA 조건: 0개)",
-                skipped_count=skipped,
-            )
+            result = _make_result(stem, _FAIL, "SKIPPED_ITEMS",
+                                  f"스킵 {skipped}개 (QA 조건: 0개)", skipped_count=skipped)
             results.append(result)
             logger.error(f"  FAIL: 스킵 {skipped}개")
             continue
 
-        # 텍스트 비교
         mismatches = _compare_blocks(actual_blocks, expected["blocks"], args.verbose, logger)
 
         if mismatches:
-            # LLM에게 실패 원인 분류 요청
-            failure_analysis = _classify_failure_with_llm(
-                stem, expected.get("doc_type", "UNKNOWN"), mismatches, logger
-            )
-            result = _make_result(
-                stem, _FAIL, failure_analysis.get("cause", "UNKNOWN"),
-                failure_analysis.get("explanation", f"{len(mismatches)}개 불일치"),
-                mismatches=mismatches,
-                skipped_count=skipped,
-                fix_suggestion=failure_analysis.get("fix_suggestion", ""),
-            )
+            # 실패 입력 저장 (Claude가 원인 분류)
+            failure_input = {
+                "sample": stem,
+                "doc_type": expected.get("doc_type", "UNKNOWN"),
+                "mismatch_count": len(mismatches),
+                "mismatches": mismatches[:20],
+            }
+            failure_inputs.append(failure_input)
+
+            result = _make_result(stem, _FAIL, "TEXT_MISMATCH",
+                                  f"{len(mismatches)}개 불일치", mismatches=mismatches)
             results.append(result)
-            logger.error(
-                f"  FAIL: {len(mismatches)}개 불일치 "
-                f"[{failure_analysis.get('cause')}] {failure_analysis.get('explanation','')}"
-            )
-            if failure_analysis.get("fix_suggestion"):
-                logger.info(f"  수정 방향: {failure_analysis['fix_suggestion']}")
+            logger.error(f"  FAIL: {len(mismatches)}개 불일치")
         else:
             result = _make_result(stem, _PASS, "", "전체 일치")
             results.append(result)
             logger.info(f"  PASS: {stem}")
+
+    # 실패 원인 분류 (Claude Code가 담당)
+    if failure_inputs:
+        failure_input_path = os.path.join(_REPORTS_DIR, f"qa_failure_input_{timestamp}.json")
+        with open(failure_input_path, "w", encoding="utf-8") as f:
+            json.dump({"failures": failure_inputs}, f, ensure_ascii=False, indent=2)
+        logger.info(f"\n>>> Claude Code가 {failure_input_path} 를 읽고 실패 원인을 분류해야 합니다.")
+        logger.info(f">>> 결과를 qa_failure_analysis_{timestamp}.json 에 작성해 주세요.")
+
+        # 분석 결과 파일이 있으면 결과에 반영
+        analysis_path = os.path.join(_REPORTS_DIR, f"qa_failure_analysis_{timestamp}.json")
+        if os.path.exists(analysis_path):
+            with open(analysis_path, encoding="utf-8") as f:
+                analysis = json.load(f)
+            _apply_analysis(results, analysis)
 
     # 리포트 작성
     report_path = os.path.join(_REPORTS_DIR, f"qa_report_{timestamp}.json")
@@ -209,56 +179,24 @@ def main() -> int:
         for r in results:
             if r["verdict"] == _FAIL:
                 print(f"  ✗ {r['sample']}: [{r['reason_code']}] {r['reason']}")
-                if r.get("fix_suggestion"):
-                    print(f"    → {r['fix_suggestion']}")
+                if r.get("cause"):
+                    print(f"    원인: {r['cause']} – {r.get('fix_suggestion','')}")
     print("=" * 60)
 
     return 0 if overall == "QA_PASSED" else 1
 
 
-# ── LLM 실패 원인 분류 ────────────────────────────────────────────────────
+# ── 헬퍼 ─────────────────────────────────────────────────────────────────
 
-def _classify_failure_with_llm(
-    sample: str, doc_type: str, mismatches: List[Dict], logger
-) -> Dict[str, str]:
-    """Claude에게 QA 실패 원인을 분류하도록 요청한다."""
+def _apply_analysis(results: List[Dict], analysis: Dict) -> None:
+    """Claude가 작성한 실패 분석을 결과 목록에 반영한다."""
+    by_sample = {a["sample"]: a for a in analysis.get("analyses", [])}
+    for r in results:
+        if r["verdict"] == _FAIL and r["sample"] in by_sample:
+            a = by_sample[r["sample"]]
+            r["cause"] = a.get("cause", "")
+            r["fix_suggestion"] = a.get("fix_suggestion", "")
 
-    mm_text = "\n".join(
-        f"  [{i}] 기대: {m.get('expected','')!r}  →  실제: {m.get('actual','')!r}"
-        for i, m in enumerate(mismatches[:10])
-    )
-    if not mm_text:
-        # COUNT_MISMATCH만 있는 경우
-        cnt = next((m for m in mismatches if m.get("type") == "COUNT_MISMATCH"), {})
-        mm_text = f"  블록 수 불일치: 기대={cnt.get('expected_count')}, 실제={cnt.get('actual_count')}"
-
-    prompt = _FAILURE_CLASSIFY_PROMPT.format(
-        sample=sample,
-        doc_type=doc_type,
-        mismatch_count=len(mismatches),
-        mismatches=mm_text,
-    )
-
-    fallback = {
-        "cause": "CODE_ISSUE",
-        "explanation": "LLM 분류 실패 – 수동 확인 필요",
-        "fix_suggestion": "불일치 목록을 직접 검토하세요.",
-    }
-
-    try:
-        result = ask_json(prompt, fallback=None)
-        cause = result.get("cause", "CODE_ISSUE")
-        allowed = ("CODE_ISSUE", "DOCUMENT_ISSUE", "RULE_ISSUE", "ANSWER_DATA_ISSUE")
-        if cause not in allowed:
-            cause = "CODE_ISSUE"
-        result["cause"] = cause
-        return result
-    except Exception as exc:
-        logger.warning(f"  LLM 실패 분류 오류 ({exc}), fallback 반환.")
-        return fallback
-
-
-# ── 유틸 ─────────────────────────────────────────────────────────────────
 
 def _collect_samples() -> List[str]:
     if not os.path.isdir(_SAMPLES_DIR):
@@ -290,59 +228,44 @@ def _load_answer(answer_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _compare_blocks(
-    actual: List[Dict], expected_blocks: List[Dict], verbose: bool, logger
-) -> List[Dict[str, Any]]:
+def _compare_blocks(actual, expected_blocks, verbose, logger) -> List[Dict]:
     mismatches = []
     if len(actual) != len(expected_blocks):
-        mismatches.append({
-            "type": "COUNT_MISMATCH",
-            "actual_count": len(actual),
-            "expected_count": len(expected_blocks),
-        })
+        mismatches.append({"type": "COUNT_MISMATCH",
+                           "actual_count": len(actual),
+                           "expected_count": len(expected_blocks)})
         logger.warning(f"  블록 수 불일치: actual={len(actual)}, expected={len(expected_blocks)}")
-
     for i, (act, exp) in enumerate(zip(actual, expected_blocks)):
-        act_text = str(act.get("text", "")).strip()
-        exp_text = str(exp.get("text", "")).strip()
-        if act_text != exp_text:
-            mm = {"type": "TEXT_MISMATCH", "index": i, "actual": act_text, "expected": exp_text}
-            mismatches.append(mm)
+        at = str(act.get("text", "")).strip()
+        et = str(exp.get("text", "")).strip()
+        if at != et:
+            mismatches.append({"type": "TEXT_MISMATCH", "index": i, "actual": at, "expected": et})
             if verbose:
-                logger.warning(f"  [{i}] 기대={exp_text!r}  실제={act_text!r}")
+                logger.warning(f"  [{i}] 기대={et!r}  실제={at!r}")
     return mismatches
 
 
-def _make_result(
-    sample: str, verdict: str, reason_code: str, reason: str,
-    mismatches: Optional[List] = None, skipped_count: int = 0,
-    fix_suggestion: str = "",
-) -> Dict[str, Any]:
+def _make_result(sample, verdict, reason_code, reason,
+                 mismatches=None, skipped_count=0) -> Dict[str, Any]:
     return {
-        "sample": sample,
-        "verdict": verdict,
-        "reason_code": reason_code,
-        "reason": reason,
-        "fix_suggestion": fix_suggestion,
-        "skipped_count": skipped_count,
-        "mismatches": mismatches or [],
-        "timestamp": datetime.now().isoformat(),
+        "sample": sample, "verdict": verdict, "reason_code": reason_code,
+        "reason": reason, "skipped_count": skipped_count,
+        "mismatches": mismatches or [], "timestamp": datetime.now().isoformat(),
+        "cause": "", "fix_suggestion": "",
     }
 
 
 def _write_report(results: List[Dict], path: str) -> None:
     passed = sum(1 for r in results if r["verdict"] == _PASS)
-    report = {
-        "overall": "QA_PASSED" if passed == len(results) else "QA_FAILED",
-        "total": len(results),
-        "passed": passed,
-        "failed": len(results) - passed,
-        "generated_at": datetime.now().isoformat(),
-        "failure_analyst": "llm",
-        "results": results,
-    }
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "overall": "QA_PASSED" if passed == len(results) else "QA_FAILED",
+            "total": len(results), "passed": passed,
+            "failed": len(results) - passed,
+            "generated_at": datetime.now().isoformat(),
+            "failure_analyst": "claude_code",
+            "results": results,
+        }, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

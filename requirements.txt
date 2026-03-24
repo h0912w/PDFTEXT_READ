@@ -1,15 +1,8 @@
-# LLM (에이전트 판단 영역)
-anthropic>=0.40.0
-
 # Core PDF processing
-pdfplumber>=0.10.0
-PyMuPDF>=1.23.0
+pdfplumber>=0.10.0      # 텍스트 레이어 추출 (DIGITAL/HYBRID)
+PyMuPDF>=1.23.0         # PDF → 이미지 렌더링 (Claude Code가 볼 수 있도록)
 
-# OCR
-pytesseract>=0.3.10
-# easyocr>=1.7.0  # optional: pip install easyocr (large dependency)
-
-# Image processing
+# Image processing (스캔 전처리용)
 opencv-python>=4.8.0
 Pillow>=10.0.0
 
@@ -20,8 +13,6 @@ pandas>=2.0.0
 # Numeric
 numpy>=1.24.0
 
-# External system requirements (install separately):
-# - Tesseract OCR: https://github.com/tesseract-ocr/tesseract
-#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
-#   macOS:   brew install tesseract tesseract-lang
-#   Linux:   sudo apt install tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng
+# ── 제거된 항목 ────────────────────────────────────────────────────────────
+# pytesseract, easyocr → 불필요: OCR은 Claude Code가 직접 수행
+# anthropic            → 불필요: 이 대화 자체가 LLM (Claude Code)

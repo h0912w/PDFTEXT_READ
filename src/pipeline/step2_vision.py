@@ -1,10 +1,28 @@
 """
-Step 2: OCR / vision-based text and layout analysis.
+Step 2: OCR – 이미지에서 텍스트와 위치 추출.
+[에이전트(Claude Code) 판단 영역]
 
-Runs OCR on each page image (SCANNED / HYBRID / ocr_priority).
-Produces word-level TextBlocks with confidence scores and bounding boxes.
+스크립트 역할:
+  1. 처리 대상 페이지 이미지 경로 목록을 vision_input.json 에 저장
+  2. Claude가 작성한 vision_output.json 을 읽어 TextBlock 구성
 
-Supported engines: tesseract (default), easyocr (optional).
+Claude Code 담당:
+  - vision_input.json 의 이미지를 직접 읽고 (Read 도구)
+  - 각 페이지에서 텍스트와 위치(bbox: [x0,y0,x1,y1], 0~1 정규화)를 추출
+  - vision_output.json 에 결과 작성
+
+vision_output.json 형식:
+{
+  "pages": {
+    "1": [
+      {"text": "추출된 텍스트", "bbox": [0.1, 0.05, 0.9, 0.12], "confidence": 0.95, "rotated": false},
+      ...
+    ],
+    "2": [...]
+  }
+}
+
+bbox 기준: 페이지 좌상단 (0,0) ~ 우하단 (1,1), 정규화된 비율값
 
 State transition: PREPROCESSED_FOR_OCR → VISION_ANALYZED
 """
@@ -12,186 +30,113 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.models.state import (
     DocumentType,
     PipelineContext,
     ProcessingStatus,
-    ReadingDirection,
     TextBlock,
     TextStatus,
 )
 from src.pipeline.step1_text_layer import _sort_ltr, _sort_ttb
+from src.models.state import ReadingDirection
 from src.utils.logger import get_logger
-
-# Maximum retries per page for OCR errors
-_MAX_OCR_RETRIES = 2
 
 
 def run(ctx: PipelineContext) -> PipelineContext:
-    """Run OCR on all pages that require it."""
+    """
+    OCR 대상 이미지 목록을 저장하고, Claude의 텍스트 추출 결과를 읽어 TextBlock을 구성한다.
+    """
     logger = get_logger()
-    logger.info("Step 2: Running OCR / vision analysis…")
-
-    engine = ctx.options.get("ocr_engine", "tesseract")
-    ocr_priority = ctx.options.get("ocr_priority", False)
-
-    # Collect OCR results per page: {page_num: [raw_word_dict]}
-    ocr_results: Dict[int, List[Dict[str, Any]]] = {}
+    logger.info("Step 2: 이미지 OCR 데이터 수집 중…")
 
     try:
+        ocr_priority = ctx.options.get("ocr_priority", False)
+
+        # 대상 페이지 정보 수집
+        vision_input: Dict[str, Any] = {"pages": {}}
+        needs_ocr_pages = []
+
         for pi in ctx.page_infos:
             needs_ocr = (
                 pi.doc_type in (DocumentType.SCANNED.value, DocumentType.HYBRID.value)
                 or ocr_priority
             )
-            if not needs_ocr:
-                ocr_results[pi.page_num] = []
-                continue
-
             img_path = pi.preprocessed_image_path or pi.image_path
-            if not img_path or not os.path.exists(img_path):
-                logger.warning(f"  Page {pi.page_num}: no image found, skipping OCR.")
-                ocr_results[pi.page_num] = []
-                ctx.add_warning(f"Page {pi.page_num}: no image for OCR.")
-                continue
 
-            words = _run_ocr_with_retry(img_path, engine, pi.page_num, logger)
-            ocr_results[pi.page_num] = words
-            logger.info(f"  Page {pi.page_num}: {len(words)} word(s) from OCR.")
+            vision_input["pages"][str(pi.page_num)] = {
+                "needs_ocr": needs_ocr,
+                "doc_type": pi.doc_type,
+                "direction": pi.direction,
+                "image_path": img_path,
+                "preprocessed_image_path": pi.preprocessed_image_path,
+                "original_image_path": pi.image_path,
+            }
+            if needs_ocr:
+                needs_ocr_pages.append(pi.page_num)
 
-        # Build OCR TextBlocks (stored separately; Step 3 merges them)
-        ctx.options["_ocr_raw"] = {str(k): v for k, v in ocr_results.items()}
+        # vision_input.json 저장
+        input_path = os.path.join(ctx.work_dir, "intermediate", "vision_input.json")
+        with open(input_path, "w", encoding="utf-8") as f:
+            json.dump(vision_input, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"OCR 대상 페이지: {needs_ocr_pages}")
+        logger.info(f"vision_input.json 저장 완료: {input_path}")
+
+        if needs_ocr_pages:
+            logger.info(">>> Claude Code가 아래 이미지들을 읽고 vision_output.json 을 작성해야 합니다:")
+            for page_num in needs_ocr_pages:
+                img = vision_input["pages"][str(page_num)].get("image_path", "")
+                logger.info(f"    Page {page_num}: {img}")
+
+        # vision_output.json 읽기 (Claude 작성)
+        output_path = os.path.join(ctx.work_dir, "intermediate", "vision_output.json")
+        ocr_results = _load_output(output_path, vision_input)
+
+        # OCR 결과를 options에 임시 저장 (Step 3에서 사용)
+        ctx.options["_ocr_raw"] = ocr_results
+
         ctx.status = ProcessingStatus.VISION_ANALYZED
         _save(ctx, ocr_results)
-        logger.info(f"Step 2 complete. Status: {ctx.status}")
+        logger.info(f"Step 2 완료. Status: {ctx.status}")
 
     except Exception as exc:
         ctx.status = ProcessingStatus.FAILED
-        ctx.add_error(f"Step 2 failed: {exc}")
-        logger.error(f"Step 2 failed: {exc}", exc_info=True)
+        ctx.add_error(f"Step 2 실패: {exc}")
+        logger.error(f"Step 2 실패: {exc}", exc_info=True)
 
     return ctx
 
 
-# ── OCR engines ───────────────────────────────────────────────────────────
+# ── output JSON 로드 ──────────────────────────────────────────────────────
 
-def _run_ocr_with_retry(
-    img_path: str, engine: str, page_num: int, logger
-) -> List[Dict[str, Any]]:
-    """Run OCR with automatic retry on failure."""
-    for attempt in range(1, _MAX_OCR_RETRIES + 2):
-        try:
-            if engine == "easyocr":
-                return _ocr_easyocr(img_path, page_num)
-            else:
-                return _ocr_tesseract(img_path, page_num)
-        except Exception as exc:
-            if attempt <= _MAX_OCR_RETRIES:
-                logger.warning(f"  Page {page_num}: OCR attempt {attempt} failed ({exc}), retrying…")
-            else:
-                logger.error(f"  Page {page_num}: OCR failed after {_MAX_OCR_RETRIES + 1} attempts: {exc}")
-                return []
-    return []
-
-
-def _ocr_tesseract(img_path: str, page_num: int) -> List[Dict[str, Any]]:
+def _load_output(output_path: str, vision_input: dict) -> Dict[str, List[Dict]]:
     """
-    Run pytesseract and return normalized word dicts.
-    Requires Tesseract to be installed on the system.
+    Claude가 작성한 vision_output.json 을 읽는다.
+    파일이 없으면 빈 결과를 반환한다.
     """
-    import pytesseract
-    from PIL import Image
+    logger = get_logger()
+    if os.path.exists(output_path):
+        with open(output_path, encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info("vision_output.json 로드 완료.")
+        return {k: v for k, v in data.get("pages", {}).items()}
 
-    img = Image.open(img_path)
-    img_w, img_h = img.size
-
-    # Use HOCR-style data output for bbox + confidence
-    data = pytesseract.image_to_data(
-        img,
-        lang="kor+eng",
-        config="--psm 3",
-        output_type=pytesseract.Output.DICT,
-    )
-
-    words = []
-    n = len(data["text"])
-    for i in range(n):
-        text = str(data["text"][i]).strip()
-        conf = int(data["conf"][i])
-        if not text or conf < 0:
-            continue
-
-        left = int(data["left"][i])
-        top = int(data["top"][i])
-        width = int(data["width"][i])
-        height = int(data["height"][i])
-
-        if width <= 0 or height <= 0:
-            continue
-
-        # Normalize bbox
-        x0 = left / max(1, img_w)
-        y0 = top / max(1, img_h)
-        x1 = (left + width) / max(1, img_w)
-        y1 = (top + height) / max(1, img_h)
-
-        words.append({
-            "text": text,
-            "bbox": [x0, y0, x1, y1],
-            "confidence": conf / 100.0,
-            "rotated": False,
-            "page_num": page_num,
-        })
-
-    return words
+    logger.warning("vision_output.json 없음 → OCR 결과 없이 진행 (텍스트 레이어만 사용).")
+    # 빈 결과 파일 생성 (다음 실행 시 Claude가 채울 수 있도록)
+    empty = {"pages": {str(pn): [] for pn in vision_input["pages"]}}
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(empty, f, ensure_ascii=False, indent=2)
+    return {str(pn): [] for pn in vision_input["pages"]}
 
 
-def _ocr_easyocr(img_path: str, page_num: int) -> List[Dict[str, Any]]:
-    """
-    Run EasyOCR and return normalized word dicts.
-    Requires: pip install easyocr
-    """
-    import easyocr
-    from PIL import Image
-
-    img = Image.open(img_path)
-    img_w, img_h = img.size
-
-    reader = easyocr.Reader(["ko", "en"], gpu=False, verbose=False)
-    results = reader.readtext(img_path, detail=1)
-
-    words = []
-    for (bbox_pts, text, prob) in results:
-        text = str(text).strip()
-        if not text:
-            continue
-        # bbox_pts: [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]
-        xs = [p[0] for p in bbox_pts]
-        ys = [p[1] for p in bbox_pts]
-        x0 = min(xs) / max(1, img_w)
-        y0 = min(ys) / max(1, img_h)
-        x1 = max(xs) / max(1, img_w)
-        y1 = max(ys) / max(1, img_h)
-
-        words.append({
-            "text": text,
-            "bbox": [x0, y0, x1, y1],
-            "confidence": float(prob),
-            "rotated": False,
-            "page_num": page_num,
-        })
-
-    return words
-
-
-def _save(ctx: PipelineContext, ocr_results: Dict) -> None:
+def _save(ctx: PipelineContext, ocr_results: dict) -> None:
     path = os.path.join(ctx.work_dir, "intermediate", "step2_vision_layout.json")
     data = {
         "status": ctx.status,
-        "ocr_engine": ctx.options.get("ocr_engine", "tesseract"),
-        "pages": {str(k): v for k, v in ocr_results.items()},
+        "ocr_source": "claude_code_vision",
+        "pages": ocr_results,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

@@ -1,12 +1,17 @@
 """
 Step 0.5: Document type classification and per-page strategy decision.
-에이전트(LLM) 담당 영역.
+[에이전트(Claude Code) 판단 영역]
 
-Claude Vision이 각 페이지 이미지를 직접 보고 판정한다:
-  - doc_type : DIGITAL | SCANNED | HYBRID
-  - direction: LEFT_TO_RIGHT | TOP_TO_BOTTOM
+스크립트 역할:
+  1. 각 페이지를 저해상도 이미지로 렌더링 (Claude가 볼 수 있도록)
+  2. 텍스트 레이어 글자 수 측정
+  3. 판단에 필요한 데이터를 classify_input.json 에 저장
+  4. Claude가 작성한 classify_decision.json 을 읽어 PageInfo 구성
 
-LLM 호출 실패 시 규칙 기반 fallback으로 자동 전환한다.
+Claude Code 담당:
+  - classify_input.json 의 이미지 경로와 데이터를 보고
+  - 각 페이지의 doc_type / direction 을 판정
+  - classify_decision.json 에 결과 작성
 
 State transition: RECEIVED → CLASSIFIED
 """
@@ -28,78 +33,89 @@ from src.models.state import (
 )
 from src.pipeline.step0_init import parse_page_range
 from src.utils.image_utils import render_pdf_page
-from src.utils.llm_client import ask_json
 from src.utils.logger import get_logger
 
-# 분류용 저해상도 렌더링 DPI (LLM 비전 전용, 빠른 처리를 위해 낮게 설정)
-_CLASSIFY_DPI = 72
-
-# Fallback 규칙: 글자 수 임계값
-_DIGITAL_CHAR_MIN = 80
-_SCANNED_CHAR_MAX = 10
-
-_CLASSIFY_PROMPT = """\
-당신은 PDF 문서 분류 전문가입니다. 이 PDF 페이지 이미지를 분석하여 아래 JSON 형식으로만 응답하세요.
-
-분류 기준:
-- doc_type
-  • DIGITAL  : 디지털 생성 PDF. 텍스트가 선명하고 균일한 폰트, 깔끔한 레이아웃.
-  • SCANNED  : 종이 문서를 스캔/촬영한 것. 잡음, 기울기, 불균일한 밝기 등이 보임.
-  • HYBRID   : 일부 페이지는 디지털, 일부는 스캔인 혼합 문서.
-
-- direction (이 페이지의 주 읽기 방향)
-  • LEFT_TO_RIGHT : 가로 행 단위로 읽는 일반적인 방식 (한국어, 영어 등 대부분)
-  • TOP_TO_BOTTOM : 세로 열 단위로 읽는 방식 (일부 세로쓰기 문서)
-
-응답 형식 (JSON만, 다른 텍스트 없이):
-{
-  "doc_type": "DIGITAL" | "SCANNED" | "HYBRID",
-  "direction": "LEFT_TO_RIGHT" | "TOP_TO_BOTTOM",
-  "reasoning": "판정 근거를 한 문장으로"
-}
-"""
+_CLASSIFY_DPI = 72  # 판단용 저해상도 렌더링
 
 
 def run(ctx: PipelineContext) -> PipelineContext:
-    """LLM을 사용해 각 페이지를 분류하고 읽기 방향을 결정한다."""
+    """
+    페이지별 분류 데이터를 수집하고, Claude의 판단 결과를 읽어 PageInfo를 구성한다.
+    """
     logger = get_logger()
-    logger.info("Step 0.5: LLM으로 문서 분류 중…")
+    logger.info("Step 0.5: 문서 분류 데이터 수집 중…")
 
     try:
+        classify_images_dir = os.path.join(ctx.work_dir, "classify_images")
+        os.makedirs(classify_images_dir, exist_ok=True)
+
+        input_data = []
+
         with pdfplumber.open(ctx.pdf_path) as pdf:
             total = len(pdf.pages)
             target_pages = parse_page_range(ctx.options.get("page_range"), total)
             logger.info(f"총 {total}페이지, 대상: {target_pages}")
 
-            page_infos: List[PageInfo] = []
+            for page_num in target_pages:
+                page = pdf.pages[page_num - 1]
+                width = float(page.width)
+                height = float(page.height)
+                words = page.extract_words() or []
+                char_count = sum(len(w["text"]) for w in words)
+                coverage = _compute_coverage(char_count, width, height)
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                for page_num in target_pages:
-                    page = pdf.pages[page_num - 1]
-                    width = float(page.width)
-                    height = float(page.height)
+                # 판단용 이미지 렌더링
+                img_path = os.path.join(classify_images_dir, f"page_{page_num:03d}.png")
+                render_pdf_page(ctx.pdf_path, page_num - 1, img_path, dpi=_CLASSIFY_DPI)
 
-                    # 분류용 저해상도 이미지 렌더링
-                    tmp_img = os.path.join(tmpdir, f"cls_page_{page_num}.png")
-                    render_pdf_page(ctx.pdf_path, page_num - 1, tmp_img, dpi=_CLASSIFY_DPI)
+                input_data.append({
+                    "page_num": page_num,
+                    "width": width,
+                    "height": height,
+                    "char_count": char_count,
+                    "text_coverage": round(coverage, 4),
+                    "image_path": img_path,
+                    "text_sample": " ".join(w["text"] for w in words[:20]),
+                })
 
-                    # 텍스트 레이어 글자 수 (LLM 판단 보조 정보)
-                    words = page.extract_words() or []
-                    char_count = sum(len(w["text"]) for w in words)
-                    coverage = _compute_coverage(char_count, width, height)
+        # classify_input.json 저장 (Claude가 읽을 판단 재료)
+        input_path = os.path.join(ctx.work_dir, "intermediate", "classify_input.json")
+        with open(input_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pdf_path": ctx.pdf_path,
+                "forced_direction": ctx.options.get("force_direction"),
+                "pages": input_data,
+            }, f, ensure_ascii=False, indent=2)
 
-                    # LLM 판정 (실패 시 규칙 기반 fallback)
-                    forced_dir = ctx.options.get("force_direction")
-                    info = _classify_with_llm(
-                        page_num, tmp_img, width, height, coverage,
-                        char_count, forced_dir, logger
-                    )
-                    page_infos.append(info)
+        logger.info(f"판단 재료 저장 완료: {input_path}")
+        logger.info(">>> Claude Code가 classify_input.json 을 보고 classify_decision.json 을 작성해야 합니다.")
 
-                    logger.info(
-                        f"  Page {page_num}: type={info.doc_type}, "
-                        f"dir={info.direction}, coverage={info.text_coverage:.2f}"
-                    )
+        # classify_decision.json 읽기 (Claude가 작성)
+        decision_path = os.path.join(ctx.work_dir, "intermediate", "classify_decision.json")
+        decision = _load_decision(decision_path, input_data, ctx.options.get("force_direction"))
+
+        # PageInfo 구성
+        page_infos: List[PageInfo] = []
+        for page_data in input_data:
+            page_num = page_data["page_num"]
+            page_decision = decision.get(str(page_num), {})
+            doc_type = _validated(page_decision.get("doc_type"), [t.value for t in DocumentType],
+                                   _fallback_type(page_data["char_count"]))
+            direction = ctx.options.get("force_direction") or _validated(
+                page_decision.get("direction"),
+                [d.value for d in ReadingDirection],
+                ReadingDirection.LEFT_TO_RIGHT.value,
+            )
+            page_infos.append(PageInfo(
+                page_num=page_num,
+                doc_type=doc_type,
+                direction=direction,
+                width=page_data["width"],
+                height=page_data["height"],
+                text_coverage=page_data["text_coverage"],
+            ))
+            logger.info(f"  Page {page_num}: type={doc_type}, dir={direction}, "
+                        f"coverage={page_data['text_coverage']:.2f}")
 
         ctx.page_infos = page_infos
         ctx.doc_type = _infer_overall_type(page_infos)
@@ -116,80 +132,54 @@ def run(ctx: PipelineContext) -> PipelineContext:
     return ctx
 
 
-# ── LLM 판정 ─────────────────────────────────────────────────────────────
+# ── decision JSON 로드 ────────────────────────────────────────────────────
 
-def _classify_with_llm(
-    page_num: int,
-    img_path: str,
-    width: float,
-    height: float,
-    coverage: float,
-    char_count: int,
-    forced_dir: str | None,
-    logger,
-) -> PageInfo:
-    """Claude Vision으로 페이지를 분류한다. 실패 시 규칙 기반 fallback."""
+def _load_decision(decision_path: str, input_data: list, forced_dir: str | None) -> dict:
+    """
+    Claude가 작성한 classify_decision.json 을 읽는다.
+    파일이 없으면 fallback(규칙 기반)으로 자동 생성한다.
+    """
+    logger = get_logger()
+    if os.path.exists(decision_path):
+        with open(decision_path, encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info(f"classify_decision.json 로드 완료.")
+        return data.get("pages", data)
 
-    # LLM fallback 기본값 (규칙 기반)
-    fallback_type = _rule_based_type(char_count)
-    fallback_dir = forced_dir or ReadingDirection.LEFT_TO_RIGHT.value
-
-    fallback = {
-        "doc_type": fallback_type,
-        "direction": fallback_dir,
-        "reasoning": "LLM 호출 실패 – 규칙 기반 fallback 적용",
-    }
-
-    try:
-        result = ask_json(_CLASSIFY_PROMPT, image_path=img_path, fallback=None)
-    except Exception as exc:
-        logger.warning(f"  Page {page_num}: LLM 분류 실패 ({exc}), fallback 적용.")
-        result = fallback
-
-    # 값 유효성 검증
-    doc_type = _validated(result.get("doc_type"), [t.value for t in DocumentType], fallback_type)
-    direction = forced_dir or _validated(
-        result.get("direction"),
-        [d.value for d in ReadingDirection],
-        fallback_dir,
-    )
-
-    if result.get("reasoning"):
-        logger.debug(f"  Page {page_num} LLM 근거: {result['reasoning']}")
-
-    return PageInfo(
-        page_num=page_num,
-        doc_type=doc_type,
-        direction=direction,
-        width=width,
-        height=height,
-        text_coverage=coverage,
-    )
+    # decision 파일 없음 → 규칙 기반 fallback 자동 적용
+    logger.warning("classify_decision.json 없음 → 규칙 기반 fallback 적용.")
+    fallback = {}
+    for p in input_data:
+        fallback[str(p["page_num"])] = {
+            "doc_type": _fallback_type(p["char_count"]),
+            "direction": forced_dir or ReadingDirection.LEFT_TO_RIGHT.value,
+            "reasoning": "fallback: classify_decision.json 없음",
+        }
+    # fallback 결과를 파일로도 저장 (다음 실행 시 재사용)
+    with open(decision_path, "w", encoding="utf-8") as f:
+        json.dump({"source": "fallback", "pages": fallback}, f, ensure_ascii=False, indent=2)
+    return fallback
 
 
 # ── 헬퍼 ─────────────────────────────────────────────────────────────────
 
-def _validated(value, allowed: list, default: str) -> str:
-    """LLM 반환값이 허용 범위 내에 있는지 확인하고, 아니면 default 반환."""
-    if isinstance(value, str) and value.upper() in [a.upper() for a in allowed]:
-        return value.upper()
-    return default
-
-
-def _rule_based_type(char_count: int) -> str:
-    """LLM 실패 시 글자 수 기반 간단 분류 (fallback 전용)."""
-    if char_count >= _DIGITAL_CHAR_MIN:
+def _fallback_type(char_count: int) -> str:
+    if char_count >= 80:
         return DocumentType.DIGITAL.value
-    if char_count <= _SCANNED_CHAR_MAX:
+    if char_count <= 10:
         return DocumentType.SCANNED.value
     return DocumentType.HYBRID.value
 
 
 def _compute_coverage(char_count: int, width: float, height: float) -> float:
     area = width * height
-    if area <= 0:
-        return 0.0
-    return min(1.0, char_count / max(1.0, area / 200.0))
+    return min(1.0, char_count / max(1.0, area / 200.0)) if area > 0 else 0.0
+
+
+def _validated(value, allowed: list, default: str) -> str:
+    if isinstance(value, str) and value.upper() in [a.upper() for a in allowed]:
+        return value.upper()
+    return default
 
 
 def _infer_overall_type(page_infos: List[PageInfo]) -> str:
@@ -205,11 +195,9 @@ def _infer_overall_type(page_infos: List[PageInfo]) -> str:
 
 def _save(ctx: PipelineContext) -> None:
     path = os.path.join(ctx.work_dir, "intermediate", "document_classification.json")
-    data = {
-        "overall_type": ctx.doc_type,
-        "status": ctx.status,
-        "classifier": "llm",
-        "pages": [pi.to_dict() for pi in ctx.page_infos],
-    }
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "overall_type": ctx.doc_type,
+            "status": ctx.status,
+            "pages": [pi.to_dict() for pi in ctx.page_infos],
+        }, f, ensure_ascii=False, indent=2)
